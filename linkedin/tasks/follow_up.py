@@ -68,9 +68,54 @@ def _next_followup_deal(campaign):
     return None
 
 
-def handle_follow_up(task, session, qualifiers):
+def _send_to_deal(session, deal, message: str) -> bool:
+    """Send a message to a deal's lead and do the post-send bookkeeping.
+
+    Returns True on success. On send failure the deal is moved back to
+    QUALIFIED for re-connection (mirrors the original handler behavior).
+    """
     from linkedin_cli.actions.message import send_raw_message
+    from linkedin.db.deals import set_profile_state
+
+    public_id = deal.lead.public_identifier
+    profile = _build_send_profile(deal)
+    sent = send_raw_message(session, profile, message)
+    if not sent:
+        set_profile_state(session, public_id, ProfileState.QUALIFIED.value)
+        logger.warning("follow_up for %s: send failed — moving to QUALIFIED for re-connection", public_id)
+        return False
+    session.linkedin_profile.record_action(ActionLog.ActionType.FOLLOW_UP, session.campaign)
+    # Persist the outgoing message locally and bump update_date so the next
+    # slot's eligibility query respects the cooldown and cycles this deal back.
+    from linkedin.db.chat import sync_conversation
+    try:
+        sync_conversation(session, public_id)
+    except Exception:
+        logger.exception("post-send sync failed for %s (best-effort)", public_id)
+    deal.save()
+    return True
+
+
+def _flush_approved(session, campaign) -> bool:
+    """Send the oldest manually-approved queued message, if any. Returns True if one was sent."""
+    from linkedin.db import outbound
+
+    msg = outbound.next_approved(campaign)
+    if msg is None or msg.deal is None:
+        return False
+
+    public_id = msg.lead.public_identifier
+    logger.info("[%s] %s (approved) %s", campaign, colored("▶ follow_up", "green", attrs=["bold"]), public_id)
+    if _send_to_deal(session, msg.deal, msg.body):
+        outbound.mark_sent(msg)
+    else:
+        outbound.mark_failed(msg)
+    return True
+
+
+def handle_follow_up(task, session, qualifiers):
     from linkedin.agents.follow_up import run_follow_up_agent
+    from linkedin.db import outbound
     from linkedin.db.deals import set_profile_state
     from linkedin.db.summaries import materialize_profile_summary_if_missing
 
@@ -80,12 +125,22 @@ def handle_follow_up(task, session, qualifiers):
         logger.info("[%s] follow_up: daily limit reached — slot skipped", campaign)
         return
 
+    # Approve-before-send: drain manually-approved messages first.
+    if not campaign.auto_send and _flush_approved(session, campaign):
+        return
+
     deal = _next_followup_deal(campaign)
     if deal is None:
         logger.info("[%s] follow_up: no eligible CONNECTED deal — slot skipped", campaign)
         return
 
     public_id = deal.lead.public_identifier
+
+    # In review mode, don't re-generate for a deal already awaiting approval.
+    if not campaign.auto_send and outbound.has_pending_approval(deal):
+        logger.info("[%s] follow_up: %s awaiting approval — slot skipped", campaign, public_id)
+        return
+
     logger.info(
         "[%s] %s %s",
         campaign, colored("▶ follow_up", "green", attrs=["bold"]), public_id,
@@ -94,27 +149,17 @@ def handle_follow_up(task, session, qualifiers):
     materialize_profile_summary_if_missing(deal, session)
     decision = run_follow_up_agent(session, deal)
 
-    profile = _build_send_profile(deal)
-
     if decision.action == "send_message":
-        logger.info("[%s] follow_up message for %s: %s", campaign, public_id, decision.message)
-        sent = send_raw_message(session, profile, decision.message)
-        if not sent:
-            set_profile_state(session, public_id, ProfileState.QUALIFIED.value)
-            logger.warning("follow_up for %s: send failed — moving to QUALIFIED for re-connection", public_id)
-            return
-        session.linkedin_profile.record_action(
-            ActionLog.ActionType.FOLLOW_UP, session.campaign,
-        )
-        # Persist the outgoing message locally and bump update_date so the
-        # next slot's eligibility query respects the cooldown and moves
-        # this deal to the back of the queue.
-        from linkedin.db.chat import sync_conversation
-        try:
-            sync_conversation(session, public_id)
-        except Exception:
-            logger.exception("post-send sync failed for %s (best-effort)", public_id)
-        deal.save()
+        kind = outbound.kind_for(deal)
+        if campaign.auto_send:
+            logger.info("[%s] follow_up message for %s: %s", campaign, public_id, decision.message)
+            if _send_to_deal(session, deal, decision.message):
+                outbound.record_sent(deal, decision.message, kind)
+        else:
+            outbound.enqueue_for_approval(deal, decision.message, kind)
+            # Bump update_date so the eligibility query cycles to another deal
+            # while this one waits on approval.
+            deal.save()
 
     elif decision.action == "mark_completed":
         set_profile_state(session, public_id, ProfileState.COMPLETED.value, outcome=decision.outcome)

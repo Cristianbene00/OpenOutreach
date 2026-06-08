@@ -1,0 +1,7 @@
+node_modules/
+dist/
+*.local
+*.tsbuildinfo
+# tsc -b emits these from vite.config.ts; Vite consumes the .ts directly.
+vite.config.js
+vite.config.d.ts

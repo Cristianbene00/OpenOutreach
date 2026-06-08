@@ -256,6 +256,12 @@ def _exit_on_checkpoint(session, task, url: str) -> None:
     )
     logger.error("Clear the challenge in a real browser: %s", url)
     logger.error("Then restart the daemon.")
+    # Surface the state to the control center before halting.
+    from linkedin.models import LinkedInProfile
+    profile = session.linkedin_profile
+    profile.connection_status = LinkedInProfile.ConnectionStatus.CHECKPOINT
+    profile.last_login_error = f"Security checkpoint: {url}"
+    profile.save(update_fields=["connection_status", "last_login_error"])
     task.mark_failed()
     session.close()
     sys.exit(1)
@@ -266,125 +272,180 @@ def _exit_on_checkpoint(session, task, url: str) -> None:
 # ------------------------------------------------------------------
 
 
-def run_daemon(session):
-    from linkedin.ml.hub import fetch_kit
-    from linkedin.setup.freemium import import_freemium_campaign
+class _ProfileWorker:
+    """Per-LinkedIn-account state: a browser session + lazily-built qualifiers.
+
+    The browser is only launched when there's an actual task to run (claiming
+    and planning are DB-only), so unconfigured/idle accounts cost nothing.
+    """
+
+    def __init__(self, session, kit):
+        self.session = session
+        self._kit = kit
+        self._qualifiers = None
+        self._freemium_seeded = False
+
+    def active_campaign_ids(self) -> list[int]:
+        """Enabled (or freemium) campaign ids for this account, fresh each cycle."""
+        # campaigns is a cached_property — drop it so newly created/enabled
+        # campaigns appear without a daemon restart.
+        self.session.__dict__.pop("campaigns", None)
+        return [
+            c.pk for c in self.session.campaigns
+            if c.enabled or c.is_freemium
+        ]
+
+    def ensure_ready(self):
+        """Launch the browser, build qualifiers, seed freemium — once."""
+        self.session.ensure_browser()
+        if self._qualifiers is None:
+            self._qualifiers = _build_qualifiers(
+                self.session.campaigns, CAMPAIGN_CONFIG,
+                kit_model=self._kit["model"] if self._kit else None,
+            )
+        if self._kit and not self._freemium_seeded:
+            self._seed_freemium()
+            self._freemium_seeded = True
+
+    @property
+    def qualifiers(self):
+        return self._qualifiers or {}
+
+    def _seed_freemium(self):
+        from linkedin.setup.freemium import import_freemium_campaign, seed_profiles
+
+        freemium_campaign = import_freemium_campaign(self._kit["config"])
+        if not freemium_campaign:
+            return
+        prev = getattr(self.session, "campaign", None)
+        self.session.campaign = freemium_campaign
+        try:
+            seed_profiles(self.session, self._kit["config"])
+        finally:
+            self.session.campaign = prev
+
+
+def _dispatch(task, session, qualifiers) -> str:
+    """Run one task. Returns 'ok' | 'failed' | 'stop' (LLM error → halt account)."""
     from linkedin.models import Campaign
 
-    cfg = CAMPAIGN_CONFIG
+    campaign = Campaign.objects.filter(pk=task.payload.get("campaign_id")).first()
+    if not campaign:
+        logger.error("Campaign %s not found", task.payload.get("campaign_id"))
+        task.mark_failed()
+        return "failed"
 
-    # Load kit model for freemium campaigns
-    kit = fetch_kit()
-    if kit:
-        freemium_campaign = import_freemium_campaign(kit["config"])
-        if freemium_campaign:
-            prev_campaign = session.campaign
-            session.campaign = freemium_campaign
-            from linkedin.setup.freemium import seed_profiles
-            seed_profiles(session, kit["config"])
-            session.campaign = prev_campaign
+    session.campaign = campaign
+    task.mark_running()
 
-    qualifiers = _build_qualifiers(
-        session.campaigns, cfg, kit_model=kit["model"] if kit else None,
-    )
+    handler = _HANDLERS.get(task.task_type)
+    if handler is None:
+        logger.error("Unknown task type: %s", task.task_type)
+        task.mark_failed()
+        return "failed"
 
-    campaigns = session.campaigns
-    if not campaigns:
-        logger.error("No campaigns found — cannot start daemon")
-        return
+    try:
+        with failure_diagnostics(session):
+            handler(task, session, qualifiers)
+    except CheckpointChallengeError as exc:
+        _exit_on_checkpoint(session, task, exc.url)
+    except AuthenticationError:
+        logger.warning("Session expired during %s — re-authenticating", task)
+        try:
+            session.reauthenticate()
+        except CheckpointChallengeError as exc:
+            _exit_on_checkpoint(session, task, exc.url)
+        except Exception:
+            logger.exception("Re-authentication failed for %s", task)
+        task.mark_failed()
+        return "failed"
+    except ModelHTTPError as e:
+        task.mark_failed()
+        logger.error(
+            colored("Account paused — LLM API error", "red", attrs=["bold"])
+            + "\n%s\nCheck llm_provider, ai_model, llm_api_key, and llm_api_base in Site Configuration.", e,
+        )
+        return "stop"
+    except Exception:
+        task.mark_failed()
+        logger.exception("Task %s failed", task)
+        return "failed"
 
-    logger.info(
-        colored("Daemon started", "green", attrs=["bold"])
-        + " — %d campaigns, task queue worker",
-        len(campaigns),
-    )
+    task.mark_completed()
+    return "ok"
 
-    # cloud_promo = _CloudPromoRotator(interval=60)  # tmp disabled — see below
+
+def run_daemon():
+    """Multi-account task-queue worker.
+
+    Each cycle round-robins over every active LinkedIn account, running at most
+    one task per account before moving on (one headed browser at a time — running
+    many concurrently is too heavy for the self-host target). Accounts/campaigns
+    are picked up live from the DB as users finish self-serve onboarding and click
+    Start, so the daemon never needs a restart for config changes.
+    """
+    from linkedin.ml.hub import fetch_kit
+    from linkedin.models import LinkedInProfile
+    from linkedin.browser.registry import get_or_create_session
+    from linkedin.tasks.scheduler import reconcile
+
+    kit = fetch_kit()  # shared freemium model, loaded once
+
+    logger.info(colored("Daemon started", "green", attrs=["bold"]) + " — multi-account task queue worker")
+
     heartbeat = Heartbeat()
     rhythm = _HumanRhythmBreak(heartbeat)
+    workers: dict[int, _ProfileWorker] = {}
 
-    # Single-threaded: one task at a time, no concurrent enqueuing,
-    # so sleeping until the next scheduled_at is safe.
     while True:
         pause = seconds_until_active()
         if pause > 0:
             h, m = int(pause // 3600), int(pause % 3600 // 60)
             logger.info("Outside active hours — sleeping %dh%02dm", h, m)
-            sleep_with_heartbeat(
-                pause, heartbeat, f"outside active hours, {h}h{m:02d}m left",
-            )
+            sleep_with_heartbeat(pause, heartbeat, f"outside active hours, {h}h{m:02d}m left")
             rhythm.reset()
             continue
 
-        task = Task.objects.claim_next()
-        if task is None:
-            # Nothing ready — reconcile the queue from CRM state. Any deal
-            # stuck without a pending task (e.g. because a prior handler
-            # crashed) gets a fresh task here; this is the retry mechanism.
-            from linkedin.tasks.scheduler import reconcile
-            reconcile(session)
+        profiles = list(LinkedInProfile.objects.filter(active=True).select_related("user"))
+        if not profiles:
+            sleep_with_heartbeat(3600, heartbeat, "no active accounts")
+            rhythm.reset()
+            continue
 
-            wait = Task.objects.seconds_to_next()
-            if wait is None:
-                logger.info("Queue empty after reconcile — sleeping 1h")
-                sleep_with_heartbeat(3600, heartbeat, "queue empty")
-                rhythm.reset()
+        did_work = False
+        next_waits: list[float] = []
+
+        for profile in profiles:
+            worker = workers.get(profile.pk)
+            if worker is None:
+                worker = _ProfileWorker(get_or_create_session(profile), kit)
+                workers[profile.pk] = worker
+
+            campaign_ids = worker.active_campaign_ids()
+            if not campaign_ids:
+                continue  # nothing enabled for this account
+
+            task = Task.objects.claim_next_for(campaign_ids)
+            if task is None:
+                # DB-only planning — no browser needed.
+                reconcile(worker.session)
+                wait = Task.objects.seconds_to_next(campaign_ids)
+                if wait is not None:
+                    next_waits.append(wait)
                 continue
-            if wait > 0:
-                h, m = int(wait // 3600), int(wait % 3600 // 60)
-                logger.info("Next task in %dh%02dm — sleeping", h, m)
-                sleep_with_heartbeat(
-                    wait, heartbeat, f"next task in {h}h{m:02d}m",
-                )
-                rhythm.reset()
-            continue
 
-        campaign = Campaign.objects.filter(pk=task.payload.get("campaign_id")).first()
-        if not campaign:
-            logger.error("Campaign %s not found", task.payload.get("campaign_id"))
-            task.mark_failed()
-            continue
+            worker.ensure_ready()  # launch browser only now that there's work
+            result = _dispatch(task, worker.session, worker.qualifiers)
+            if result == "stop":
+                # Skip this account for the rest of the cycle; other accounts run.
+                continue
+            did_work = True
+            rhythm.maybe_break()
 
-        session.campaign = campaign
-        task.mark_running()
-
-        handler = _HANDLERS.get(task.task_type)
-        if handler is None:
-            logger.error("Unknown task type: %s", task.task_type)
-            task.mark_failed()
-            continue
-
-        try:
-            with failure_diagnostics(session):
-                handler(task, session, qualifiers)
-        except CheckpointChallengeError as exc:
-            _exit_on_checkpoint(session, task, exc.url)
-        except AuthenticationError:
-            logger.warning("Session expired during %s — re-authenticating", task)
-            try:
-                session.reauthenticate()
-            except CheckpointChallengeError as exc:
-                _exit_on_checkpoint(session, task, exc.url)
-            except Exception:
-                logger.exception("Re-authentication failed for %s", task)
-            # Either way, mark this task FAILED; reconcile will re-create a
-            # fresh task for the deal on the next idle cycle.
-            task.mark_failed()
-            continue
-        except ModelHTTPError as e:
-            task.mark_failed()
-            logger.error(
-                colored("Daemon stopped — LLM API error", "red", attrs=["bold"])
-                + "\n%s\nCheck llm_provider, ai_model, llm_api_key, and llm_api_base in Admin → Site Configuration.", e,
-            )
-            return
-        except Exception:
-            task.mark_failed()
-            logger.exception("Task %s failed", task)
-            continue
-
-        task.mark_completed()
-        # TODO(tmp): Cloud/CLI promo disabled — still advertises the retired
-        # openoutreach CLI (GH issue). Re-enable with email-first messaging.
-        # cloud_promo.maybe_log()
-        rhythm.maybe_break()
+        if not did_work:
+            wait = min(next_waits) if next_waits else 3600
+            wait = max(wait, 1)
+            h, m = int(wait // 3600), int(wait % 3600 // 60)
+            logger.info("No ready tasks — sleeping %dh%02dm", h, m)
+            sleep_with_heartbeat(wait, heartbeat, f"idle, next in {h}h{m:02d}m")
+            rhythm.reset()

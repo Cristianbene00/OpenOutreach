@@ -140,9 +140,21 @@ def _render_system_prompt(session, deal, recent_messages: list) -> str:
     env = jinja2.Environment(loader=jinja2.FileSystemLoader(str(PROMPTS_DIR)))
     template = env.get_template("follow_up_agent.j2")
 
+    from linkedin.db.outbound import has_outgoing_message
+
     campaign = deal.campaign
     self_prof = session.self_profile
     self_name = f"{self_prof.get('first_name', '')} {self_prof.get('last_name', '')}".strip() or session.django_user.username
+
+    # Pick the user-authored template that seeds this message. The first message
+    # to a lead uses the connection-note template; later nudges use the
+    # follow-up template. The agent personalizes it — it's guidance, not a
+    # verbatim send.
+    is_first_touch = not has_outgoing_message(deal.lead)
+    message_template = (
+        campaign.connection_note_template if is_first_touch
+        else campaign.follow_up_template
+    ) or ""
 
     now = timezone.now()
     return template.render(
@@ -157,6 +169,8 @@ def _render_system_prompt(session, deal, recent_messages: list) -> str:
         today=now.strftime("%Y-%m-%d"),
         days_since_last_outgoing=_days_since_last_outgoing(recent_messages, now),
         unanswered_outgoing=_count_unanswered_outgoing(recent_messages),
+        message_template=message_template,
+        is_first_touch=is_first_touch,
     )
 
 

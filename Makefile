@@ -1,5 +1,15 @@
 .DEFAULT_GOAL := help
-.PHONY: help logs test docker-test stop build up up-view install setup run admin view
+.PHONY: help logs test docker-test stop build up up-view install setup run admin web view \
+	frontend-install frontend-build frontend-dev
+
+# Use the local virtualenv's interpreter when present (venv/ or .venv/),
+# otherwise fall back to `python` on PATH (e.g. inside the Docker image).
+PYTHON := $(shell if [ -x venv/bin/python ]; then echo venv/bin/python; \
+	elif [ -x .venv/bin/python ]; then echo .venv/bin/python; \
+	else echo python; fi)
+PYTEST := $(shell if [ -x venv/bin/pytest ]; then echo venv/bin/pytest; \
+	elif [ -x .venv/bin/pytest ]; then echo .venv/bin/pytest; \
+	else echo pytest; fi)
 
 help:
 	@perl -nle'print $& if m{^[a-zA-Z_-]+:.*?## .*$$}' $(MAKEFILE_LIST) | sort | awk 'BEGIN {FS = ":.*?## "}; {printf "\033[36m%-25s\033[0m %s\n", $$1, $$2}'
@@ -10,21 +20,33 @@ install: ## install all Python dependencies (local dev)
 
 setup: install ## install deps + Playwright browsers + migrate + bootstrap CRM
 	playwright install --with-deps chromium
-	python manage.py migrate --no-input
-	python manage.py setup_crm
+	$(PYTHON) manage.py migrate --no-input
+	$(PYTHON) manage.py setup_crm
 
-run: ## run the daemon
-	python manage.py rundaemon
+run: ## run the daemon (task queue worker)
+	$(PYTHON) manage.py rundaemon
 
 test: ## run the test suite
-	.venv/bin/pytest
+	$(PYTEST)
 
-admin: ## start the Django Admin web server
+# Control center web app (React SPA + DRF API)
+frontend-install: ## install the React SPA dependencies
+	cd frontend && npm install
+
+frontend-build: ## build the React SPA into frontend/dist (served by Django)
+	cd frontend && npm run build
+
+frontend-dev: ## run the Vite dev server (proxies /api to localhost:8000 — run `make web` too)
+	cd frontend && npm run dev
+
+web: ## serve the control center (SPA + API) — build the SPA first with `make frontend-build`
 	@echo ""
-	@echo "  Django Admin: http://localhost:8000/admin/"
-	@echo "  No superuser yet? Run: python manage.py createsuperuser"
+	@echo "  Control center: http://localhost:8000/"
+	@echo "  Django Admin:   http://localhost:8000/admin/"
 	@echo ""
-	python manage.py runserver
+	$(PYTHON) manage.py runserver
+
+admin: web ## alias for `make web` (control center + admin)
 
 # Docker targets
 logs: ## follow the logs of the service

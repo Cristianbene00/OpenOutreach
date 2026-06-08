@@ -14,11 +14,9 @@ class Command(BaseCommand):
         self._configure_logging(verbose=options["verbosity"] >= 2)
         self._ensure_db()
         self._ensure_onboarded()
-        session = self._create_session()
-        self._ensure_newsletter(session)
 
         from linkedin.daemon import run_daemon
-        run_daemon(session)
+        run_daemon()
 
     # -- Steps ---------------------------------------------------------------
 
@@ -36,6 +34,13 @@ class Command(BaseCommand):
         setup_crm()
 
     def _ensure_onboarded(self):
+        """Offer the legacy TTY wizard when run interactively with no config.
+
+        In the control-center (web-driven) flow this is a no-op: the daemon
+        idles and picks up accounts/campaigns from the DB as users complete
+        self-serve onboarding and click Start — so a missing config is no
+        longer fatal.
+        """
         from linkedin.onboarding import apply, collect_from_wizard, missing_keys
 
         if not missing_keys():
@@ -44,38 +49,10 @@ class Command(BaseCommand):
         if sys.stdin.isatty():
             apply(collect_from_wizard())
         else:
-            missing = missing_keys()
-            self.stderr.write(
-                f"Onboarding incomplete and no TTY available.\n"
-                f"Missing: {', '.join(sorted(missing))}\n"
-                f"Run with an interactive terminal to complete onboarding."
+            logger.info(
+                "Onboarding incomplete (%s) — idling until configured via the "
+                "control center.", ", ".join(sorted(missing_keys())),
             )
-            sys.exit(1)
-
-    def _create_session(self):
-        from linkedin.browser.registry import get_first_active_profile, get_or_create_session
-        from linkedin.models import SiteConfig
-
-        if not SiteConfig.load().llm_api_key:
-            logger.error("LLM_API_KEY is required. Set it in Site Configuration (Django Admin).")
-            sys.exit(1)
-
-        profile = get_first_active_profile()
-        if profile is None:
-            logger.error("No active LinkedIn profiles found.")
-            sys.exit(1)
-
-        session = get_or_create_session(profile)
-
-        if not session.campaigns:
-            logger.error("No campaigns found for this user.")
-            sys.exit(1)
-        campaign = next(
-            (c for c in session.campaigns if not c.is_freemium), None,
-        ) or session.campaigns[0]
-        session.campaign = campaign
-
-        return session
 
     def _ensure_newsletter(self, session):
         if session.linkedin_profile.newsletter_processed:

@@ -74,11 +74,22 @@ GPR (sklearn, ConstantKernel * RBF) inside Pipeline(StandardScaler, GPR) with BA
 
 ## Django Apps
 
-Three apps in `INSTALLED_APPS`:
+Four apps in `INSTALLED_APPS`:
 
-- **`linkedin`** — Main app: Campaign (with users M2M), LinkedInProfile, SearchKeyword, ActionLog, Task models. All automation logic.
+- **`linkedin`** — Main app: Campaign (with users M2M), LinkedInProfile, SearchKeyword, ActionLog, Task, **OutboundMessage** models. All automation logic.
 - **`crm`** — Lead (with embedding) and Deal models (in `crm/models/lead.py` and `crm/models/deal.py`). Also defines `Outcome` enum.
 - **`chat`** — `ChatMessage` model (GenericForeignKey to any object, content, owner, answer_to threading, topic).
+- **`controlcenter`** — DRF API for the self-serve web UI (no models). See *Control Center* below.
+
+## Control Center (web UI)
+
+Self-serve, multi-user web app that replaces Django-Admin-only operation. A **React SPA** (`frontend/`, Vite + TypeScript + Tailwind, built to `frontend/dist`) is served by Django: `linkedin/urls.py:spa` (`@ensure_csrf_cookie`) renders `frontend/dist/index.html` as a template for any non-`/api`/`/admin`/`/static` path, and the hashed bundle is served under `/static/` (`FRONTEND_DIST` is on `STATICFILES_DIRS` + `TEMPLATES.DIRS`). The SPA calls a **DRF API** under `/api/` using **session auth + CSRF** (same origin; reads the `csrftoken` cookie, sends `X-CSRFToken` on unsafe methods — see `frontend/src/api.ts`).
+
+**API (`controlcenter/`):** `views.py` (APIViews + ViewSets, all scoped to `request.user`), `serializers.py` (secrets write-only, exposed as `*_set` booleans), `urls.py` (router, `trailing_slash=False`), `services.py:derive_connection_status` (pure cookie/`li_at`-expiry status, no browser). Endpoints: `auth/{signup,login,logout,me}` (signup → `create_user` with a usable password, **not** staff), `settings/llm` (SiteConfig singleton), `linkedin` (the user's `LinkedInProfile`, 1:1; `connection_status` derived), `campaigns` (ICP CRUD + `start`/`stop` detail actions flipping `Campaign.enabled`), `queue` (`OutboundMessage` list + `approve`/`reject`/PATCH-edit), `deals` (read-only + `messages` action reading `ChatMessage` via the GenericForeignKey), `dashboard` (per-user ORM aggregates). `onboarding.py:user_onboarding_status(user)` drives the SPA setup checklist.
+
+**SPA pages (`frontend/src/pages/`):** `Login`/`Signup`, `Onboarding` (checklist), `Dashboard` (funnel + daily-limit usage + LinkedIn status), `Campaigns` + `CampaignEditor` (ICP + templates + auto_send + Start/Stop), `Queue` (approve/edit/reject), `Deals` (+ conversation drawer), `LinkedIn` (credentials + status), `Settings` (LLM). `auth.tsx` is the session context; `components/Layout.tsx` the nav shell.
+
+**Run control & messaging:** the web process **never launches a browser** — it only writes DB rows. The daemon reacts on its next loop (`Campaign.enabled` gate in `scheduler.reconcile`; `OutboundMessage` queue in `tasks/follow_up.handle_follow_up` via `linkedin/db/outbound.py`). Web and daemon are two processes sharing `data/db.sqlite3`. `make web` serves it; Docker runs an extra `web` service (`compose/linkedin/start-web`).
 
 ## CRM Data Model
 

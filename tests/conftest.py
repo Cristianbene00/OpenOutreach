@@ -59,7 +59,8 @@ def fake_session(db):
 
     campaign = Campaign.objects.first()
     if campaign is None:
-        campaign = Campaign.objects.create(name="LinkedIn Outreach")
+        # enabled=True so the daemon/scheduler plans for it (run-control gate).
+        campaign = Campaign.objects.create(name="LinkedIn Outreach", enabled=True)
     campaign.users.add(user)
 
     linkedin_profile, _ = LinkedInProfile.objects.get_or_create(

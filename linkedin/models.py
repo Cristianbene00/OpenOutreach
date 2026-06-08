@@ -67,6 +67,20 @@ class Campaign(models.Model):
     seed_public_ids = models.JSONField(default=list, blank=True)
     model_blob = models.BinaryField(null=True, blank=True)
 
+    # Run control — the daemon only prospects campaigns with enabled=True.
+    # Flipped by the control center "Start/Stop Prospecting" buttons.
+    enabled = models.BooleanField(default=False)
+
+    # Messaging — templates seed the AI follow-up agent (it personalizes them).
+    # connection_note_template seeds the FIRST message sent once CONNECTED
+    # (linkedin_cli's connect request can't carry a note); follow_up_template
+    # guides subsequent nudges.
+    connection_note_template = models.TextField(blank=True, default="")
+    follow_up_template = models.TextField(blank=True, default="")
+    # When False, generated messages wait in the queue for manual approval
+    # instead of being sent automatically.
+    auto_send = models.BooleanField(default=True)
+
     def __str__(self):
         return self.name
 
@@ -96,6 +110,24 @@ class LinkedInProfile(models.Model):
     legal_accepted = models.BooleanField(default=False)
     cookie_data = models.JSONField(null=True, blank=True)
     newsletter_processed = models.BooleanField(default=False)
+
+    # Surfaced to the control center so the UI can show the LinkedIn link state.
+    # Stamped by the daemon's login flow (browser/launch.py).
+    class ConnectionStatus(models.TextChoices):
+        NOT_CONFIGURED = "not_configured", "Not configured"
+        PENDING_LOGIN = "pending_login", "Pending login"
+        CONNECTED = "connected", "Connected"
+        EXPIRED = "expired", "Session expired"
+        CHECKPOINT = "checkpoint", "Checkpoint required"
+        ERROR = "error", "Error"
+
+    connection_status = models.CharField(
+        max_length=20,
+        choices=ConnectionStatus.choices,
+        default=ConnectionStatus.NOT_CONFIGURED,
+    )
+    last_login_error = models.TextField(blank=True, default="")
+    last_login_at = models.DateTimeField(null=True, blank=True)
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -194,12 +226,31 @@ class TaskQuerySet(models.QuerySet):
     def pending(self):
         return self.filter(status=Task.Status.PENDING).order_by("scheduled_at")
 
+    def for_campaigns(self, campaign_ids):
+        """Restrict to tasks whose payload campaign_id is in *campaign_ids*."""
+        return self.filter(payload__campaign_id__in=list(campaign_ids))
+
     def claim_next(self) -> "Task | None":
         return self.pending().filter(scheduled_at__lte=timezone.now()).first()
 
-    def seconds_to_next(self) -> float | None:
-        """Seconds until the next pending task, or None if queue is empty."""
-        next_task = self.pending().only("scheduled_at").first()
+    def claim_next_for(self, campaign_ids) -> "Task | None":
+        """Oldest due pending task scoped to a set of campaigns."""
+        return (
+            self.for_campaigns(campaign_ids)
+            .pending()
+            .filter(scheduled_at__lte=timezone.now())
+            .first()
+        )
+
+    def seconds_to_next(self, campaign_ids=None) -> float | None:
+        """Seconds until the next pending task, or None if queue is empty.
+
+        When *campaign_ids* is given, only those campaigns' tasks count.
+        """
+        qs = self.pending()
+        if campaign_ids is not None:
+            qs = self.for_campaigns(campaign_ids).pending()
+        next_task = qs.only("scheduled_at").first()
         if next_task is None:
             return None
         return max((next_task.scheduled_at - timezone.now()).total_seconds(), 0)
@@ -249,3 +300,54 @@ class Task(models.Model):
     def mark_failed(self):
         self.status = self.Status.FAILED
         self.save(update_fields=["status"])
+
+
+class OutboundMessage(models.Model):
+    """A message the AI composed for a lead — the reviewable "queue" row.
+
+    When ``Campaign.auto_send`` is True the daemon sends immediately and logs
+    one of these with ``status=SENT`` for the activity view. When auto_send is
+    False, the daemon writes ``status=PENDING_APPROVAL`` and waits — the control
+    center approves/edits/rejects, and a later slot sends APPROVED rows.
+    """
+
+    class Kind(models.TextChoices):
+        FIRST_TOUCH = "first_touch", "First touch"
+        FOLLOW_UP = "follow_up", "Follow up"
+
+    class Status(models.TextChoices):
+        PENDING_APPROVAL = "pending_approval", "Pending approval"
+        APPROVED = "approved", "Approved"
+        SENT = "sent", "Sent"
+        REJECTED = "rejected", "Rejected"
+        FAILED = "failed", "Failed"
+
+    campaign = models.ForeignKey(
+        Campaign, on_delete=models.CASCADE, related_name="outbound_messages",
+    )
+    lead = models.ForeignKey(
+        "crm.Lead", on_delete=models.CASCADE, related_name="outbound_messages",
+    )
+    deal = models.ForeignKey(
+        "crm.Deal", on_delete=models.CASCADE, related_name="outbound_messages",
+        null=True, blank=True,
+    )
+    kind = models.CharField(max_length=20, choices=Kind.choices, default=Kind.FOLLOW_UP)
+    status = models.CharField(
+        max_length=20, choices=Status.choices, default=Status.PENDING_APPROVAL,
+    )
+    body = models.TextField()
+    created_at = models.DateTimeField(auto_now_add=True)
+    decided_at = models.DateTimeField(null=True, blank=True)
+    sent_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        app_label = "linkedin"
+        indexes = [
+            models.Index(fields=["campaign", "status"]),
+            models.Index(fields=["deal", "status"]),
+        ]
+        ordering = ["-created_at"]
+
+    def __str__(self):
+        return f"{self.kind} [{self.status}] → {self.lead_id}"

@@ -3,7 +3,15 @@ from django.contrib import admin
 
 from chat.models import ChatMessage
 
-from linkedin.models import ActionLog, Campaign, LinkedInProfile, SearchKeyword, SiteConfig, Task
+from linkedin.models import (
+    ActionLog,
+    Campaign,
+    LinkedInProfile,
+    OutboundMessage,
+    SearchKeyword,
+    SiteConfig,
+    Task,
+)
 
 
 @admin.register(SiteConfig)
@@ -19,8 +27,17 @@ class SiteConfigAdmin(admin.ModelAdmin):
 
 @admin.register(Campaign)
 class CampaignAdmin(admin.ModelAdmin):
-    list_display = ("name", "booking_link", "is_freemium", "action_fraction")
+    list_display = ("name", "enabled", "auto_send", "booking_link", "is_freemium", "action_fraction")
+    list_filter = ("enabled", "auto_send", "is_freemium")
     filter_horizontal = ("users",)
+
+
+@admin.register(OutboundMessage)
+class OutboundMessageAdmin(admin.ModelAdmin):
+    list_display = ("kind", "status", "campaign", "lead", "created_at", "sent_at")
+    list_filter = ("status", "kind", "campaign")
+    raw_id_fields = ("campaign", "lead", "deal")
+    date_hierarchy = "created_at"
 
 
 @admin.register(LinkedInProfile)

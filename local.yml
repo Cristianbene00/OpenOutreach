@@ -18,3 +18,23 @@ services:
       - .:/app
     ports:
       - "6080:6080"
+
+  # Control center web app (SPA + API). Shares the build, code, and SQLite DB
+  # with the daemon. NOTE: the bind mount above shadows the image-baked
+  # frontend/dist, so for local Docker dev build the SPA on the host first:
+  # `make frontend-build`.
+  web:
+    build:
+      context: .
+      dockerfile: ./compose/linkedin/Dockerfile
+      args:
+        - BUILD_ENV=local
+    command: /start-web
+    restart: unless-stopped
+    environment:
+      - HOST_UID=${HOST_UID:-1000}
+      - HOST_GID=${HOST_GID:-1000}
+    volumes:
+      - .:/app
+    ports:
+      - "8000:8000"

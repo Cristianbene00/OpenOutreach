@@ -1,3 +1,11 @@
+# ── Stage 0: build the control center SPA ───────────────────────
+FROM node:20-slim AS frontend
+WORKDIR /frontend
+COPY ./frontend/package.json ./frontend/package-lock.json* ./
+RUN npm install
+COPY ./frontend ./
+RUN npm run build
+
 # ── Stage 1: build dependencies ─────────────────────────────────
 FROM python:3.12-slim-bookworm AS deps
 
@@ -38,9 +46,12 @@ WORKDIR ${APP_HOME}
 
 COPY ./compose/linkedin/entrypoint /entrypoint
 COPY ./compose/linkedin/start /start
-RUN sed -i 's/\r$//g' /entrypoint /start && chmod +x /entrypoint /start
+COPY ./compose/linkedin/start-web /start-web
+RUN sed -i 's/\r$//g' /entrypoint /start /start-web && chmod +x /entrypoint /start /start-web
 
 COPY --chown=ubuntu:ubuntu . ${APP_HOME}
+# Bake the built SPA in (a bind-mount in local.yml shadows it; production has none).
+COPY --from=frontend --chown=ubuntu:ubuntu /frontend/dist ${APP_HOME}/frontend/dist
 RUN chown ubuntu:ubuntu ${APP_HOME}
 
 ENTRYPOINT ["/entrypoint"]

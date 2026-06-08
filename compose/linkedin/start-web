@@ -1,0 +1,13 @@
+#!/bin/bash
+# compose/start-web — serve the control center (SPA + DRF API).
+# No browser/Xvfb here; that lives in the daemon container (`start`).
+
+set -o errexit
+set -o pipefail
+set -o nounset
+
+python manage.py migrate --no-input
+python manage.py setup_crm
+
+# Dev server (DEBUG). For production put a real WSGI server (gunicorn) in front.
+exec python manage.py runserver 0.0.0.0:8000

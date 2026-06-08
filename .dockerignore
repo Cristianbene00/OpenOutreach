@@ -1,7 +1,10 @@
 .git
 .github
 .venv
+venv
 .pytest_cache
 .idea
 __pycache__
 .vscode
+frontend/node_modules
+frontend/dist

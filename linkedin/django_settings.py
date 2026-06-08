@@ -14,11 +14,14 @@ ROOT_DIR = Path(__file__).resolve().parent.parent
 
 BASE_DIR = ROOT_DIR
 
-SECRET_KEY = "openoutreach-local-dev-key-change-in-production"
+# Dev defaults; override via environment for real self-hosting.
+SECRET_KEY = os.environ.get(
+    "OPENOUTREACH_SECRET_KEY", "openoutreach-local-dev-key-change-in-production",
+)
 
-DEBUG = True
+DEBUG = os.environ.get("OPENOUTREACH_DEBUG", "true").lower() != "false"
 
-ALLOWED_HOSTS = ["*"]
+ALLOWED_HOSTS = os.environ.get("OPENOUTREACH_ALLOWED_HOSTS", "*").split(",")
 
 INSTALLED_APPS = [
     "django.contrib.sites",
@@ -28,10 +31,21 @@ INSTALLED_APPS = [
     "django.contrib.sessions",
     "django.contrib.messages",
     "django.contrib.staticfiles",
+    "rest_framework",
     "crm.apps.CrmConfig",
     "chat.apps.ChatConfig",
     "linkedin",
+    "controlcenter",
 ]
+
+REST_FRAMEWORK = {
+    "DEFAULT_AUTHENTICATION_CLASSES": [
+        "rest_framework.authentication.SessionAuthentication",
+    ],
+    "DEFAULT_PERMISSION_CLASSES": [
+        "rest_framework.permissions.IsAuthenticated",
+    ],
+}
 
 MIDDLEWARE = [
     "django.middleware.security.SecurityMiddleware",
@@ -46,10 +60,15 @@ MIDDLEWARE = [
 
 ROOT_URLCONF = "linkedin.urls"
 
+# Built single-page-app bundle (Vite output). The control center SPA's
+# index.html is loaded as a Django template; its hashed assets live in
+# ``frontend/dist/assets`` and are served via staticfiles.
+FRONTEND_DIST = ROOT_DIR / "frontend" / "dist"
+
 TEMPLATES = [
     {
         "BACKEND": "django.template.backends.django.DjangoTemplates",
-        "DIRS": [],
+        "DIRS": [FRONTEND_DIST],
         "APP_DIRS": True,
         "OPTIONS": {
             "context_processors": [
@@ -75,11 +94,14 @@ SITE_ID = 1
 
 STATIC_URL = "/static/"
 STATIC_ROOT = ROOT_DIR / "staticfiles"
+# Serve the SPA's hashed bundle (frontend/dist/assets/*) under /static/.
+STATICFILES_DIRS = [d for d in [FRONTEND_DIST] if d.exists()]
 
 MEDIA_URL = "/media/"
 MEDIA_ROOT = ROOT_DIR / "media"
 
-LOGIN_URL = "/admin/login/"
+# Control center SPA login route (the API returns 401/403; the SPA redirects).
+LOGIN_URL = "/login"
 
 DEFAULT_FROM_EMAIL = "noreply@localhost"
 EMAIL_SUBJECT_PREFIX = "CRM: "

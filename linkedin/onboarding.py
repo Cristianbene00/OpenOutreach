@@ -93,6 +93,30 @@ def missing_keys() -> set[str]:
     return keys
 
 
+def user_onboarding_status(user) -> dict:
+    """Per-user onboarding completeness for the control center checklist.
+
+    Unlike ``missing_keys`` (a global daemon-startup gate), this is scoped to a
+    single control-center account so the SPA can render a setup checklist.
+    """
+    from linkedin.models import Campaign, LinkedInProfile, SiteConfig
+
+    cfg = SiteConfig.load()
+    llm_ready = bool(cfg.llm_provider and cfg.llm_api_key and cfg.ai_model)
+    if cfg.llm_provider == SiteConfig.LLMProvider.OPENAI_COMPATIBLE and not cfg.llm_api_base:
+        llm_ready = False
+
+    linkedin_ready = LinkedInProfile.objects.filter(user=user, active=True).exists()
+    has_campaign = Campaign.objects.filter(users=user).exists()
+
+    return {
+        "llm_configured": llm_ready,
+        "linkedin_configured": linkedin_ready,
+        "has_campaign": has_campaign,
+        "complete": llm_ready and linkedin_ready and has_campaign,
+    }
+
+
 # ---------------------------------------------------------------------------
 # Interactive collection (needs TTY)
 # ---------------------------------------------------------------------------

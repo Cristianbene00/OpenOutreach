@@ -296,6 +296,10 @@ def reconcile(session) -> None:
     startup and whenever the queue has no ready task."""
     _recover_stale_running_tasks()
     for campaign in session.campaigns:
+        # Run control: the control center toggles Campaign.enabled. Freemium
+        # campaigns (imported from the kit) are always plannable.
+        if not campaign.enabled and not campaign.is_freemium:
+            continue
         for planner in _PLANNERS:
             planner(session, campaign)
 

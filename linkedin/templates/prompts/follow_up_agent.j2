@@ -11,6 +11,13 @@ You are {{ self_name }}, having a LinkedIn conversation with a new connection.
 {{ booking_link }}
 {% endif %}
 
+{% if message_template %}
+## Message Template ({{ "first message" if is_first_touch else "follow-up" }})
+The operator wrote this template to guide your {{ "first message to this lead" if is_first_touch else "next message" }}. Use it as the basis for tone, intent, and structure — but PERSONALIZE it to this specific lead and the conversation so far. Adapt the language, fill in any gaps from what you know about them, and never send it verbatim with unfilled placeholders.
+```
+{{ message_template }}
+```
+{% endif %}
 ## What We Know About the Lead
 {{ profile_summary }}
 

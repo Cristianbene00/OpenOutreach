@@ -28,6 +28,18 @@ def _save_cookies(session):
     session.linkedin_profile.save(update_fields=["cookie_data"])
 
 
+def _mark_connected(session):
+    """Stamp the control-center connection status after a verified login."""
+    from linkedin.models import LinkedInProfile
+    from django.utils import timezone
+
+    lp = session.linkedin_profile
+    lp.connection_status = LinkedInProfile.ConnectionStatus.CONNECTED
+    lp.last_login_error = ""
+    lp.last_login_at = timezone.now()
+    lp.save(update_fields=["connection_status", "last_login_error", "last_login_at"])
+
+
 def start_browser_session(session):
     logger.debug("Configuring browser for %s", session)
 
@@ -59,4 +71,7 @@ def start_browser_session(session):
     # beacons, lazy media) and on LinkedIn that event may never fire,
     # hanging the daemon for the duration of the browser timeout.
     session.page.wait_for_load_state("domcontentloaded")
+    # Login verified (fresh or restored) — clear any prior checkpoint/error so
+    # the control center reflects recovery.
+    _mark_connected(session)
     logger.info(colored("Browser ready", "green", attrs=["bold"]))
