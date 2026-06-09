@@ -68,9 +68,9 @@ GPR (sklearn, ConstantKernel * RBF) inside Pipeline(StandardScaler, GPR) with BA
 
 1. **Balance-driven selection** — n_negatives > n_positives → exploit (highest P); otherwise → explore (highest BALD).
 2. **LLM decision** — All decisions via LLM (`qualify_lead.j2`). GP only for candidate selection and confidence gate.
-3. **READY_TO_CONNECT gate** — P(f > 0.5) above `min_ready_to_connect_prob` (0.9) promotes QUALIFIED → READY_TO_CONNECT.
+3. **READY_TO_CONNECT gate** (`ready_pool.py`) — when the GP is **fitted**, `promote_to_ready` promotes QUALIFIED leads whose `P(f > 0.5)` clears `min_ready_to_connect_prob` (0.9). On **cold start** (GP not fitted), promotion is LLM-gated: it promotes a bounded batch (`COLD_START_PROMOTE_BATCH`, 5) of already-LLM-qualified leads directly, so a fresh campaign starts connecting instead of stalling (the GP needs labels, but nothing reaches READY to drive activity until then); GP gating resumes once it fits. Symmetrically, `find_ready_candidate` ranks READY leads by GP mean when fitted and falls back to **FIFO** (oldest first) on cold start — a deal that is *already* READY_TO_CONNECT is always connectable, since the confidence gate applies at promotion, not selection.
 
-384-dim FastEmbed embeddings stored directly on Lead model, per-campaign GP models at ``Campaign.model_blob` (BinaryField, joblib-dumped with `compress=3`)`. Cold start returns None until >=2 labels of both classes.
+384-dim FastEmbed embeddings stored directly on Lead model, per-campaign GP models at ``Campaign.model_blob` (BinaryField, joblib-dumped with `compress=3`)`. The GP needs >=2 labels of both classes to fit; until then the cold-start paths above keep the pipeline moving.
 
 ## Django Apps
 

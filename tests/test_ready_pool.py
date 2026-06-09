@@ -53,7 +53,9 @@ class TestPromoteToReady:
         assert alice_deal.state == ProfileState.READY_TO_CONNECT
         assert bob_deal.state == ProfileState.QUALIFIED
 
-    def test_returns_zero_on_cold_start(self, fake_session):
+    def test_promotes_llm_qualified_on_cold_start(self, fake_session):
+        # Cold start (GP unfitted): the LLM already qualified the lead, so it
+        # should be promoted directly so connecting can begin.
         _make_qualified(fake_session)
 
         scorer = BayesianQualifier(seed=42)
@@ -64,7 +66,25 @@ class TestPromoteToReady:
         ), patch.object(
             scorer, "predict_probs", return_value=None,
         ):
-            assert promote_to_ready(fake_session, scorer, threshold=0.9) == 0
+            assert promote_to_ready(fake_session, scorer, threshold=0.9) == 1
+
+        from crm.models import Deal
+        deal = Deal.objects.get(lead__linkedin_url="https://www.linkedin.com/in/alice/")
+        assert deal.state == ProfileState.READY_TO_CONNECT
+
+    def test_cold_start_promotion_is_bounded(self, fake_session):
+        from linkedin.pipeline.ready_pool import COLD_START_PROMOTE_BATCH
+
+        for i in range(COLD_START_PROMOTE_BATCH + 2):
+            _make_qualified(fake_session, f"lead{i}")
+
+        scorer = BayesianQualifier(seed=42)
+        with patch(
+            "crm.models.lead.Lead.get_embedding", return_value=np.ones(384),
+        ), patch.object(scorer, "predict_probs", return_value=None):
+            promoted = promote_to_ready(fake_session, scorer, threshold=0.9)
+
+        assert promoted == COLD_START_PROMOTE_BATCH
 
     def test_returns_zero_on_empty_pool(self, fake_session):
         scorer = BayesianQualifier(seed=42)
@@ -87,6 +107,19 @@ class TestGetReadyCandidate:
 
         scorer = BayesianQualifier(seed=42)
         scorer.rank_profiles = lambda profiles, **kw: profiles
+
+        result = find_ready_candidate(fake_session, scorer)
+        assert result is not None
+        assert result["public_identifier"] == "alice"
+
+    def test_cold_start_falls_back_to_fifo(self, fake_session):
+        # GP can't rank (cold start) — an already-READY lead must still be
+        # selectable rather than stranded.
+        _make_qualified(fake_session, "alice")
+        set_profile_state(fake_session, "alice", ProfileState.READY_TO_CONNECT.value)
+
+        scorer = BayesianQualifier(seed=42)
+        scorer.rank_profiles = lambda profiles, **kw: []  # cold start
 
         result = find_ready_candidate(fake_session, scorer)
         assert result is not None

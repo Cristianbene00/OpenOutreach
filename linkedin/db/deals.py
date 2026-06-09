@@ -47,10 +47,11 @@ def _deals_at_state(session, state: ProfileState) -> list:
     """Return profile dicts for all Deals at the given state in this campaign."""
     from crm.models import Deal
 
-    qs = Deal.objects.filter(
-        state=state,
-        campaign=session.campaign,
-    ).select_related("lead")
+    qs = (
+        Deal.objects.filter(state=state, campaign=session.campaign)
+        .select_related("lead")
+        .order_by("update_date", "pk")  # oldest first — deterministic FIFO
+    )
     return [_deal_to_profile_dict(d) for d in qs]
 
 
